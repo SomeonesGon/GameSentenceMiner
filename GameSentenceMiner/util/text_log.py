@@ -1,16 +1,15 @@
 import enum
+import rapidfuzz
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Optional
 
-import rapidfuzz
-
+from GameSentenceMiner.util.config.configuration import logger, get_config, gsm_state
 from GameSentenceMiner.util.gsm_utils import remove_html_and_cloze_tags
-from GameSentenceMiner.util.configuration import logger, get_config, gsm_state
-from GameSentenceMiner.util.model import AnkiCard
-import re
+from GameSentenceMiner.util.models.model import AnkiCard
 
 initial_time = datetime.now()
 
@@ -19,7 +18,24 @@ class TextSource:
     OCR_MANUAL = "ocr_manual"
     HOOKER = "hooker"
     MANUAL = "manual"
+    SECONDARY = "secondary"
+    SCREEN_CROPPER = "screen_cropper"
     HOTKEY = "hotkey"
+
+    # How much padding in seconds to add when capturing text from different sources
+    _PADDING_SECONDS = {
+        OCR: 0,
+        OCR_MANUAL: 2,
+        HOOKER: 0,
+        MANUAL: 3,
+        SECONDARY: 3,
+        SCREEN_CROPPER: 5,
+        HOTKEY: 3,
+    }
+
+    @classmethod
+    def padding_seconds(cls, source: str | None) -> float:
+        return float(cls._PADDING_SECONDS.get(source, 0))
     
 @dataclass
 class GameLine:
@@ -33,6 +49,7 @@ class GameLine:
     TL: str = ""
     mined_time: datetime = datetime.min
     source: str = None
+    source_padding: float = 0.0
 
     def get_previous_time(self):
         if self.prev:
@@ -97,7 +114,8 @@ class GameText:
             next=None,
             index=self.game_line_index,
             scene=gsm_state.current_game or "",
-            source=source
+            source=source,
+            source_padding=TextSource.padding_seconds(source)
         )
         self.values_dict[line_id] = new_line
         self.game_line_index += 1

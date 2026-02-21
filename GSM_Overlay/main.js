@@ -3,6 +3,8 @@ const { ipcMain } = require("electron");
 const fs = require("fs");
 const path = require('path');
 const os = require('os');
+const http = require('http');
+const https = require('https');
 const magpie = require('./magpie');
 const bg = require('./background');
 const wanakana = require('wanakana');
@@ -32,6 +34,8 @@ fs.mkdirSync(dataPath, { recursive: true });
 app.setPath('userData', dataPath);
 
 const settingsPath = path.join(app.getPath('userData'), 'settings.json');
+const extensionsRoot = path.join(app.getPath('userData'), 'extensions');
+const extensionVersionsPath = path.join(extensionsRoot, 'versions.json');
 let manualHotkeyPressed = false;
 let manualModeToggleState = false;
 let lastManualActivity = Date.now();
@@ -81,20 +85,46 @@ let websocketStates = {
 let lastWebsocketData = null;
 let currentMagpieActive = false; // Track magpie state from websocket
 let translationRequested = false; // Track if translation has been requested for current text
+let yomitanRecoveryVersion = 0; // Cancels stale async recovery attempts when popup state flips quickly
 
 let yomitanSettingsWindow = null;
 let jitenReaderSettingsWindow = null;
 let settingsWindow = null;
 let offsetHelperWindow = null;
 let texthookerWindow = null;
+let texthookerLoadToken = 0;
 let tray = null;
 let platformOverride = null;
 let backend = null;
+const OVERLAY_PAUSE_SOURCE_MANUAL_HOTKEY = "manual_hotkey";
+const OVERLAY_PAUSE_SOURCE_TEXTHOOKER_HOTKEY = "texthooker_hotkey";
+const overlayPauseSourceActive = {
+  [OVERLAY_PAUSE_SOURCE_MANUAL_HOTKEY]: false,
+  [OVERLAY_PAUSE_SOURCE_TEXTHOOKER_HOTKEY]: false,
+};
+const overlayDevServerUrl = process.env.GSM_OVERLAY_DEV_SERVER_URL || '';
+
+function getOverlayPageUrl(relativePath) {
+  if (!isDev || !overlayDevServerUrl) {
+    return null;
+  }
+  const baseUrl = overlayDevServerUrl.endsWith('/') ? overlayDevServerUrl : `${overlayDevServerUrl}/`;
+  return new URL(relativePath, baseUrl).toString();
+}
+
+function loadOverlayPage(win, relativePath) {
+  const pageUrl = getOverlayPageUrl(relativePath);
+  if (pageUrl) {
+    return win.loadURL(pageUrl);
+  }
+  return win.loadFile(relativePath);
+}
 
 async function loadExtension(name) {
   const extDir = isDev ? path.join(__dirname, name) : path.join(process.resourcesPath, name);
+  const extTargetDir = ensureExtensionCopy(name, extDir);
   try {
-    const loadedExt = await session.defaultSession.loadExtension(extDir, { allowFileAccess: true });
+    const loadedExt = await session.defaultSession.loadExtension(extTargetDir, { allowFileAccess: true });
     console.log(`${name} extension loaded.`);
     console.log('Extension ID:', loadedExt.id);
     return loadedExt;
@@ -102,6 +132,77 @@ async function loadExtension(name) {
     console.error(`Failed to load extension ${name}:`, e);
     return null;
   }
+}
+
+function readExtensionVersions() {
+  if (!fs.existsSync(extensionVersionsPath)) {
+    return {};
+  }
+  try {
+    const data = fs.readFileSync(extensionVersionsPath, 'utf-8');
+    return JSON.parse(data);
+  } catch (e) {
+    console.warn(`Failed to read extension versions file: ${extensionVersionsPath}`, e);
+    return {};
+  }
+}
+
+function writeExtensionVersions(versions) {
+  fs.mkdirSync(extensionsRoot, { recursive: true });
+  fs.writeFileSync(extensionVersionsPath, JSON.stringify(versions, null, 2));
+}
+
+function readExtensionPackageVersion(dirPath) {
+  const pkgPath = path.join(dirPath, 'manifest.json');
+  if (!fs.existsSync(pkgPath)) {
+    return null;
+  }
+  try {
+    const data = fs.readFileSync(pkgPath, 'utf-8');
+    const pkg = JSON.parse(data);
+    return pkg && pkg.version ? String(pkg.version) : null;
+  } catch (e) {
+    console.warn(`Failed to read manifest.json at ${pkgPath}`, e);
+    return null;
+  }
+}
+
+function ensureExtensionCopy(name, sourceDir) {
+  if (!isLinux()) {
+    return sourceDir;
+  }
+  fs.mkdirSync(extensionsRoot, { recursive: true });
+  const targetDir = path.join(extensionsRoot, name);
+  const versions = readExtensionVersions();
+  const sourceVersion = readExtensionPackageVersion(sourceDir);
+  const storedVersion = versions[name] || null;
+
+  let shouldCopy = false;
+  if (!fs.existsSync(targetDir)) {
+    shouldCopy = true;
+  } else if (sourceVersion && sourceVersion !== storedVersion) {
+    shouldCopy = true;
+  }
+
+  if (shouldCopy) {
+    try {
+      fs.rmSync(targetDir, { recursive: true, force: true });
+    } catch (e) {
+      console.warn(`Failed to remove existing extension directory: ${targetDir}`, e);
+    }
+    try {
+      fs.cpSync(sourceDir, targetDir, { recursive: true });
+      console.log(`[Extensions] Copied ${name} to appdata (${targetDir})`);
+      if (sourceVersion) {
+        versions[name] = sourceVersion;
+        writeExtensionVersions(versions);
+      }
+    } catch (e) {
+      console.error(`[Extensions] Failed to copy ${name} from ${sourceDir} to ${targetDir}`, e);
+    }
+  }
+
+  return targetDir;
 }
 
 ipcMain.on('set-platform-override', (event, platform) => {
@@ -123,6 +224,10 @@ function isWindows() {
 
 function isLinux() {
   return process.platform === 'linux';
+}
+
+if (isLinux() && !fs.existsSync(settingsPath)) {
+  userSettings.manualModeType = "toggle";
 }
 
 function isMac() {
@@ -173,6 +278,51 @@ function showInactiveAndRestoreFocus() {
         type: 'restore-focus-request'
       });
     }
+  }
+}
+
+function aggressivelyShowOverlayAndReturnFocus() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  // Be intentionally aggressive here: Magpie can steal z-order during popup teardown.
+  mainWindow.show();
+  mainWindow.focus();
+  mainWindow.setAlwaysOnTop(true, "screen-saver");
+  mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  if (typeof mainWindow.moveTop === "function") {
+    try {
+      mainWindow.moveTop();
+    } catch (e) {
+      // Ignore - moveTop may not be available on all Electron/platform combos.
+    }
+  }
+}
+
+function scheduleYomitanCloseRecovery() {
+  const version = ++yomitanRecoveryVersion;
+  const recoveryDelays = [0, 80, 180, 320];
+
+  for (const delay of recoveryDelays) {
+    setTimeout(() => {
+      if (version !== yomitanRecoveryVersion) return;
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (yomitanShown || resizeMode || manualHotkeyPressed || manualModeToggleState) return;
+
+      aggressivelyShowOverlayAndReturnFocus();
+
+      // Return focus back to game shortly after forcing overlay to the top.
+      setTimeout(() => {
+        if (version !== yomitanRecoveryVersion) return;
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        if (yomitanShown || resizeMode || manualHotkeyPressed || manualModeToggleState) return;
+        if (isWindows() || isMac()) {
+          mainWindow.setIgnoreMouseEvents(true, { forward: true });
+        }
+        blurAndRestoreFocus();
+      }, 25);
+    }, delay);
   }
 }
 
@@ -234,6 +384,69 @@ function getCurrentOverlayMonitor() {
 
 let gsmSettings = getGSMSettings();
 
+function shouldOverlayHotkeyRequestPause(source) {
+  const currentSettings = getGSMSettings();
+  const experimentalEnabled = !!(currentSettings.experimental && currentSettings.experimental.enable_experimental_features);
+  const processPausing = currentSettings.process_pausing || {};
+  if (!experimentalEnabled || !processPausing.enabled) {
+    return false;
+  }
+
+  switch (source) {
+    case OVERLAY_PAUSE_SOURCE_MANUAL_HOTKEY:
+      return !!processPausing.overlay_manual_hotkey_requests_pause;
+    case OVERLAY_PAUSE_SOURCE_TEXTHOOKER_HOTKEY:
+      return !!processPausing.overlay_texthooker_hotkey_requests_pause;
+    default:
+      return false;
+  }
+}
+
+function sendOverlayPauseRequest(action, source) {
+  if (!backend) {
+    console.warn(`[ProcessPause] Backend unavailable, cannot send ${action} request for source=${source}`);
+    return false;
+  }
+
+  backend.send({
+    type: "process-pause-request",
+    action,
+    source,
+  });
+  return true;
+}
+
+function requestOverlayPauseForSource(source) {
+  if (!shouldOverlayHotkeyRequestPause(source)) {
+    return;
+  }
+
+  if (overlayPauseSourceActive[source]) {
+    return;
+  }
+
+  if (sendOverlayPauseRequest("pause", source)) {
+    overlayPauseSourceActive[source] = true;
+  }
+}
+
+function requestOverlayResumeForSource(source) {
+  const wasActive = !!overlayPauseSourceActive[source];
+  const shouldRequestByConfig = shouldOverlayHotkeyRequestPause(source);
+  overlayPauseSourceActive[source] = false;
+
+  if (!wasActive && !shouldRequestByConfig) {
+    return;
+  }
+
+  sendOverlayPauseRequest("resume", source);
+}
+
+function releaseAllOverlayPauseRequests() {
+  requestOverlayResumeForSource(OVERLAY_PAUSE_SOURCE_MANUAL_HOTKEY);
+  requestOverlayResumeForSource(OVERLAY_PAUSE_SOURCE_TEXTHOOKER_HOTKEY);
+}
+
 function saveSettings() {
   if (fs.existsSync(settingsPath)) {
     const data = fs.readFileSync(settingsPath, "utf-8");
@@ -280,10 +493,15 @@ function createTexthookerWindow() {
     },
   });
 
-  texthookerWindow.loadURL(userSettings.texthookerUrl || "http://localhost:55000/texthooker");
+  waitForTexthookerUrl(texthookerWindow, userSettings.texthookerUrl || "http://localhost:55000/texthooker");
   texthookerWindow.setOpacity(0.95);
 
   texthookerWindow.on('closed', () => {
+    texthookerLoadToken += 1;
+    if (isTexthookerMode) {
+      isTexthookerMode = false;
+      requestOverlayResumeForSource(OVERLAY_PAUSE_SOURCE_TEXTHOOKER_HOTKEY);
+    }
     texthookerWindow = null;
   });
 
@@ -291,6 +509,63 @@ function createTexthookerWindow() {
   texthookerWindow.on('show', () => {
     texthookerWindow.setAlwaysOnTop(true, "screen-saver");
   });
+}
+
+function waitForTexthookerUrl(win, targetUrl) {
+  if (!win || win.isDestroyed()) return;
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(targetUrl);
+  } catch (e) {
+    console.warn(`[TexthookerMode] Invalid URL, loading directly: ${targetUrl}`);
+    win.loadURL(targetUrl);
+    return;
+  }
+
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    win.loadURL(targetUrl);
+    return;
+  }
+
+  const token = ++texthookerLoadToken;
+  const pollIntervalMs = 500;
+  const requestTimeoutMs = 1000;
+
+  const attempt = () => {
+    if (!win || win.isDestroyed() || token !== texthookerLoadToken) return;
+
+    const client = parsedUrl.protocol === 'https:' ? https : http;
+    const req = client.request(targetUrl, { method: 'GET' }, (res) => {
+      const status = res.statusCode || 0;
+      res.resume();
+
+      if (status >= 200 && status < 400) {
+        console.log(`[TexthookerMode] URL reachable, loading: ${targetUrl}`);
+        win.loadURL(targetUrl);
+        return;
+      }
+
+      console.log(`[TexthookerMode] URL not ready (status ${status}), retrying...`);
+      setTimeout(attempt, pollIntervalMs);
+    });
+
+    req.on('timeout', () => {
+      req.destroy(new Error('timeout'));
+    });
+
+    req.on('error', (err) => {
+      if (token !== texthookerLoadToken) return;
+      console.log(`[TexthookerMode] URL not ready (${err.message}), retrying...`);
+      setTimeout(attempt, pollIntervalMs);
+    });
+
+    req.setTimeout(requestTimeoutMs);
+    req.end();
+  };
+
+  console.log(`[TexthookerMode] Waiting for URL: ${targetUrl}`);
+  attempt();
 }
 
 function registerTexthookerHotkey(oldHotkey) {
@@ -309,6 +584,7 @@ function registerTexthookerHotkey(oldHotkey) {
 
     if (isTexthookerMode) {
       console.log("[TexthookerMode] Showing...");
+      requestOverlayPauseForSource(OVERLAY_PAUSE_SOURCE_TEXTHOOKER_HOTKEY);
 
       // Sync bounds before showing
       const display = getCurrentOverlayMonitor();
@@ -336,6 +612,7 @@ function registerTexthookerHotkey(oldHotkey) {
 
     } else {
       console.log("[TexthookerMode] Hiding...");
+      requestOverlayResumeForSource(OVERLAY_PAUSE_SOURCE_TEXTHOOKER_HOTKEY);
       texthookerWindow.hide();
 
       // Go back to whatever mode it was in before
@@ -393,6 +670,7 @@ function registerManualShowHotkey(oldHotkey) {
     isOverlayVisible = true;
     console.log("[ManualHotkey] ACTION: Sending 'show-overlay-hotkey' true");
     mainWindow.webContents.send('show-overlay-hotkey', true);
+    requestOverlayPauseForSource(OVERLAY_PAUSE_SOURCE_MANUAL_HOTKEY);
 
     if (!isLinux()) {
       console.log("[ManualHotkey] ACTION: setIgnoreMouseEvents(false)");
@@ -421,6 +699,7 @@ function registerManualShowHotkey(oldHotkey) {
     isOverlayVisible = false;
     console.log("[ManualHotkey] ACTION: Sending 'show-overlay-hotkey' false");
     mainWindow.webContents.send('show-overlay-hotkey', false);
+    requestOverlayResumeForSource(OVERLAY_PAUSE_SOURCE_MANUAL_HOTKEY);
 
     if (!yomitanShown && !resizeMode) {
       if (!isLinux()) {
@@ -455,6 +734,10 @@ function registerManualShowHotkey(oldHotkey) {
       // For toggle, we usually rely on key-up logic or a debounce, 
       // but since globalShortcut is KeyDown only, we throttle simplisticly.
       // This part might need a 'canToggle' flag if it bounces, but let's log it first.
+      if (holdHeartbeat) {
+        clearInterval(holdHeartbeat);
+        holdHeartbeat = null;
+      }
       console.log("[ManualHotkey] Toggle Logic Triggered");
       manualModeToggleState = !manualModeToggleState;
       if (isOverlayVisible) {
@@ -485,8 +768,8 @@ function registerManualShowHotkey(oldHotkey) {
 
           // console.log(`[ManualHotkey] Heartbeat Tick: ${timeSincePress}ms since last signal`);
 
-          // Threshold: 450ms
-          if (timeSincePress > 600) {
+          const holdReleaseThreshold = 750;
+          if (timeSincePress > holdReleaseThreshold) {
             console.log(`[ManualHotkey] RELEASE DETECTED. Time since press: ${timeSincePress}ms`);
             hideOverlay("Hold Release");
             manualHotkeyPressed = false;
@@ -598,7 +881,7 @@ function openSettings() {
 
     settingsWindow.removeMenu()
 
-    settingsWindow.loadFile("settings.html");
+    loadOverlayPage(settingsWindow, "settings.html");
     settingsWindow.on("closed", () => {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send("force-visible", false);
@@ -726,7 +1009,7 @@ function openOffsetHelper() {
   console.log(display.bounds);
   console.log(offsetHelperWindow.getBounds());
 
-  offsetHelperWindow.loadFile("offset-helper.html");
+  loadOverlayPage(offsetHelperWindow, "offset-helper.html");
 
   offsetHelperWindow.webContents.on('did-finish-load', () => {
     if (lastWebsocketData) {
@@ -817,6 +1100,7 @@ function updateTrayMenu() {
         // When turning OFF manual mode, restore the overlay to visible state
         if (!menuItem.checked) {
           console.log("[ManualMode] Disabling manual mode via tray - restoring overlay visibility");
+          requestOverlayResumeForSource(OVERLAY_PAUSE_SOURCE_MANUAL_HOTKEY);
           isOverlayVisible = false;
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.show();
@@ -883,13 +1167,17 @@ app.whenReady().then(async () => {
     userSettings.manualMode = true; // enforce manual mode on non-Windows platforms
     // Show a warning for now saying that automatic mode is not supported, and to show the overlay manually, use the hotkey
     // Use electron dialog to show a message box
+    const manualModeNote = isLinux()
+      ? 'Note: Hold mode can feel a bit weird on Linux; toggle is recommended.'
+      : '';
     dialog.showMessageBoxSync({
       type: 'warning',
       buttons: ['OK'],
       defaultId: 0,
       title: 'GSM Overlay - Manual Mode Enforced',
       message: 'Overlay requires hotkey to show text for lookups on macOS and Linux due to platform limitations.\n\n' +
-        'Use the configured hotkey: ' + userSettings.showHotkey + ' to show/hide the overlay as needed.',
+        'Use the configured hotkey: ' + userSettings.showHotkey + ' to show/hide the overlay as needed.' +
+        (manualModeNote ? '\n\n' + manualModeNote : ''),
     });
   }
 
@@ -1206,6 +1494,7 @@ app.whenReady().then(async () => {
   });
 
   app.on('will-quit', () => {
+    releaseAllOverlayPauseRequests();
     globalShortcut.unregisterAll();
   });
 
@@ -1357,6 +1646,8 @@ app.whenReady().then(async () => {
     // Reset the activity timer on yomitan interaction
     resetActivityTimer();
 
+    // Invalidate pending close-recovery attempts whenever popup state flips.
+    yomitanRecoveryVersion += 1;
     yomitanShown = state;
     if (state) {
       if (isWindows() || isMac()) {
@@ -1376,18 +1667,10 @@ app.whenReady().then(async () => {
       if (!manualHotkeyPressed && !manualModeToggleState && !resizeMode) {
         blurAndRestoreFocus();
       }
-      // Blur again after a short delay to ensure it takes effect
-      setTimeout(() => {
-        if (!resizeMode && !yomitanShown && !manualHotkeyPressed && !manualModeToggleState) {
-          // Use currentMagpieActive from websocket instead of userSettings.magpieCompatibility
-          if (currentMagpieActive) {
-            showInactiveAndRestoreFocus();
-            mainWindow.setAlwaysOnTop(true, 'screen-saver');
-            mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-          }
-          blurAndRestoreFocus();
-        }
-      }, 100);
+      // Magpie can race z-order after popup close; reassert top layer without extra focus handoff.
+      if (currentMagpieActive) {
+        scheduleYomitanCloseRecovery();
+      }
     }
   })
 
@@ -1424,7 +1707,7 @@ app.whenReady().then(async () => {
     updateTrayMenu();
   });
 
-  mainWindow.loadFile('index.html');
+  loadOverlayPage(mainWindow, 'index.html');
   if (isDev) {
     mainWindow.webContents.on('context-menu', () => {
       mainWindow.webContents.openDevTools({ mode: 'detach' });
@@ -1613,6 +1896,9 @@ app.whenReady().then(async () => {
         registerManualShowHotkey();
         break;
       case "manualModeType":
+        if (isLinux() && value === "hold") {
+          console.warn("[ManualHotkey] Hold mode can be unreliable on Linux (globalShortcut has no key-up and no repeat on many setups).");
+        }
         registerManualShowHotkey();
         break;
       case "afkTimer":
@@ -1641,7 +1927,7 @@ app.whenReady().then(async () => {
         break;
       case "texthookerUrl":
         if (texthookerWindow && !texthookerWindow.isDestroyed()) {
-          texthookerWindow.loadURL(value);
+          waitForTexthookerUrl(texthookerWindow, value);
         }
         break;
       case "weburl2":
@@ -1693,6 +1979,7 @@ app.whenReady().then(async () => {
     // When turning OFF manual mode, restore the overlay to visible state
     if (!newValue) {
       console.log("[ManualMode] Disabling manual mode - restoring overlay visibility");
+      requestOverlayResumeForSource(OVERLAY_PAUSE_SOURCE_MANUAL_HOTKEY);
       isOverlayVisible = false; // Reset the flag since we're leaving manual mode
       // Ensure the window is visible and mouse events are enabled
       if (mainWindow && !mainWindow.isDestroyed()) {
